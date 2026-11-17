@@ -2151,8 +2151,8 @@ if (typeof window !== 'undefined' && window.addEventListener) {
     var demo = App.Backend.kind === 'demo';
     return '<div class="au-card" role="dialog" aria-labelledby="au-title">' +
       '<div class="au-logo">' + MARK + '</div>' + inner +
-      (demo ? '<p class="au-demo"><b>Demo mode.</b> Logins and data are kept in this browser only. ' +
-              'Connect the Firebase project to share live data between devices.</p>' : '') +
+      (demo ? '<p class="au-demo"><b>Demo version.</b> Everything you enter is saved only in this browser on this device — ' +
+              'nothing is sent anywhere. To try the staff login, sign out and sign in again on this same browser.</p>' : '') +
       '</div>';
   }
 
