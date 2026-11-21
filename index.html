@@ -3557,11 +3557,95 @@ Minimum version required to store current data is: `+i+`.
     return c;
   };
 
+  /* Every SKU in use (product codes and size/colour codes), normalised.
+     includeDeleted: also codes of deleted products, so a restored product never clashes. */
+  M.usedSKUs = function (exceptProductId, includeDeleted) {
+    var used = {};
+    App.db.products.forEach(function (p) {
+      if (p.id === exceptProductId || (p.deletedAt && !includeDeleted)) return;
+      if (p.sku) used[App.norm(p.sku)] = p;
+      (p.variants || []).forEach(function (v) { if (v.sku && !used[App.norm(v.sku)]) used[App.norm(v.sku)] = p; });
+    });
+    return used;
+  };
+
+  /* The product that already has this code, other than exceptProductId — or null.
+     Deleted products count too: a code is never given out again once it has been used
+     (check owner.deletedAt to tell the two apart). */
+  M.skuOwner = function (sku, exceptProductId) {
+    var k = App.norm(sku);
+    return k ? (M.usedSKUs(exceptProductId, true)[k] || null) : null;
+  };
+
+  /* "MG-0123" -> { prefix: 'MG-', num: 123, width: 4 }; null when it does not end in digits. */
+  M.splitSKU = function (sku) {
+    var m = /^(.*?)(\d+)$/.exec(String(sku || '').trim());
+    return m ? { prefix: m[1], num: parseInt(m[2], 10), width: m[2].length } : null;
+  };
+
+  /* Next automatic code. It follows the code on the product added most recently: after
+     MG-123 comes MG-124, after P0112 comes P0113. The number is one more than the highest
+     ever used with that prefix — deleted products included — so a deleted code never comes
+     back. Shops with no numbered code yet use the prefix and counter from Settings. */
   M.nextSKU = function (peek) {
-    var s = App.db.settings;
-    var c = s.skuPrefix + App.pad(s.skuNextNo, s.skuPadding);
-    if (!peek) { s.skuNextNo++; App.store.touch(); }
+    var s = App.db.settings, used = M.usedSKUs(null, true), c, n, guard;
+    var latest = function (deleted) {
+      var best = null;
+      App.db.products.forEach(function (p) {
+        if (!!p.deletedAt !== deleted) return;
+        var sp = M.splitSKU(p.sku);
+        if (sp && (!best || String(p.createdAt || '') >= best.at)) best = { at: String(p.createdAt || ''), sp: sp };
+      });
+      return best && best.sp;
+    };
+    var pat = latest(false) || latest(true);
+    if (pat) {
+      var pre = App.norm(pat.prefix), max = 0;
+      App.db.products.forEach(function (p) {
+        [p.sku].concat((p.variants || []).map(function (v) { return v.sku; })).forEach(function (code) {
+          var sp = M.splitSKU(code);
+          if (sp && App.norm(sp.prefix) === pre && sp.num > max) max = sp.num;
+        });
+      });
+      for (n = max + 1, guard = 0; guard < 100000; guard++, n++) {
+        c = pat.prefix + App.pad(n, pat.width);
+        if (!used[App.norm(c)]) break;
+      }
+      return c;
+    }
+    n = Math.max(1, App.n(s.skuNextNo) || 1);
+    for (guard = 0; guard < 100000; guard++, n++) {
+      c = s.skuPrefix + App.pad(n, s.skuPadding);
+      if (!used[App.norm(c)]) break;
+    }
+    if (!peek) { s.skuNextNo = n + 1; App.store.touch(); }
     return c;
+  };
+
+  /* Groups of live products that share one SKU (data saved before codes were checked). */
+  M.duplicateSKUs = function () {
+    var by = {};
+    M.products().forEach(function (p) { var k = App.norm(p.sku); if (k) (by[k] = by[k] || []).push(p); });
+    return Object.keys(by).filter(function (k) { return by[k].length > 1; }).map(function (k) {
+      var ps = by[k].slice().sort(function (a, b) { return String(a.createdAt) > String(b.createdAt) ? 1 : -1; });
+      return { sku: ps[0].sku, products: ps };
+    });
+  };
+
+  /* In each group the product added first keeps its code; the others get new, unused codes.
+     Bills already made keep the code they were printed with. */
+  M.fixDuplicateSKUs = function () {
+    var changes = [];
+    M.duplicateSKUs().forEach(function (g) {
+      g.products.slice(1).forEach(function (p) {
+        var from = p.sku;
+        p.sku = M.nextSKU();
+        p.updatedAt = App.nowISO();
+        changes.push({ id: p.id, name: p.name, from: from, to: p.sku });
+      });
+    });
+    if (changes.length) { App.store.touch(); App.store.saveNow(); }
+    return changes;
   };
 
   /* =========================================================
@@ -3761,7 +3845,7 @@ Minimum version required to store current data is: `+i+`.
     var minS = d.minStock === '' || d.minStock === undefined ? App.n(App.db.settings.lowStockGlobal) : App.n(d.minStock);
     var p = {
       id: App.uid('prd'),
-      sku: d.sku && d.sku.trim() ? d.sku.trim() : M.nextSKU(),
+      sku: d.sku && d.sku.trim() && !M.skuOwner(d.sku) ? d.sku.trim() : M.nextSKU(),   /* never take another product's code */
       name: (d.name || '').trim(),
       brand: (d.brand || '').trim(),
       category: d.category || M.CATEGORIES[0],
@@ -3813,6 +3897,11 @@ Minimum version required to store current data is: `+i+`.
   M.productUpdate = function (id, d) {
     var p = M.find('products', id);
     if (!p) return null;
+    if (d.sku !== undefined) {
+      var ns = String(d.sku || '').trim();
+      if (!ns) d.sku = p.sku || M.nextSKU();          /* a code is always kept */
+      else if (M.skuOwner(ns, p.id)) d.sku = p.sku;   /* never take another product's code */
+    }
     ['sku','name','brand','category','model','supplierId','notes','image'].forEach(function (k) {
       if (d[k] !== undefined) p[k] = typeof d[k] === 'string' ? d[k].trim() : d[k];
     });
@@ -7925,6 +8014,17 @@ Minimum version required to store current data is: `+i+`.
         '</div>' +
       '</div>';
 
+    /* products that share a code with another product (older data, saved before codes were checked) */
+    var dupGroups = M.duplicateSKUs();
+    if (dupGroups.length) {
+      var dupN = App.sum(dupGroups, function (g) { return g.products.length - 1; });
+      html += '<div class="banner warn mb12">' + App.icon('alert', 20) + '<div class="tx">' +
+        dupN + ' product' + (dupN === 1 ? ' shares its' : 's share their') + ' SKU code with another product' +
+        '<small>' + App.esc(dupGroups.slice(0, 4).map(function (g) { return g.sku + ': ' + g.products.map(function (x) { return x.name; }).join(' / '); }).join('  ·  ')) +
+        (dupGroups.length > 4 ? '  · …' : '') + '</small></div>' +
+        '<button class="btn btn-sm" id="pfixdup">Give new codes</button></div>';
+    }
+
     html += '<div class="flex gap8 wrap mb12">' +
       '<div style="flex:1;min-width:220px"><input id="pq" value="' + App.esc(q) + '" placeholder="Name, SKU, brand or barcode..." style="width:100%;height:46px;border-radius:11px;border:1px solid var(--border);background:var(--surface);padding:0 14px;color:var(--text)"></div>' +
       '<div class="chips">' +
@@ -7997,6 +8097,21 @@ Minimum version required to store current data is: `+i+`.
       App.stockAdjust(this.getAttribute('data-adj'));
     });
     App.el('#pnew', view).addEventListener('click', function () { App.productForm(null); });
+    var fixDupBtn = App.el('#pfixdup', view);
+    if (fixDupBtn) fixDupBtn.addEventListener('click', function () {
+      UI.confirm({ title: 'Give new codes?', okLabel: 'Give new codes',
+        html: 'In each group the product added first keeps its code. The others get new codes that no product uses.<br><br>' +
+          'Bills already made are not changed. If you print the code on price tags or barcode stickers, print new ones for these products.' })
+        .then(function (ok) {
+          if (!ok) return;
+          var ch = M.fixDuplicateSKUs();
+          UI.modal({ title: ch.length + ' new code' + (ch.length === 1 ? '' : 's') + ' given', size: 'narrow',
+            body: '<div class="tablewrap"><table class="tbl"><thead><tr><th>Product</th><th>Old</th><th>New</th></tr></thead><tbody>' +
+              ch.map(function (c) { return '<tr><td>' + App.esc(c.name) + '</td><td class="mono">' + App.esc(c.from) + '</td><td class="mono b">' + App.esc(c.to) + '</td></tr>'; }).join('') +
+              '</tbody></table></div>',
+            buttons: [{ label: 'Done', class: 'btn-primary', onClick: function (a) { a.close(); UI.render(); } }] });
+        });
+    });
     App.on(view, 'click', '[data-act="newprod"]', function () { App.productForm(null); });
     App.el('#ppurchase', view).addEventListener('click', function () { UI.go('/purchases?new=1'); });
     App.el('#pexport', view).addEventListener('click', function () {
@@ -8076,7 +8191,7 @@ Minimum version required to store current data is: `+i+`.
       { k: 'category', label: 'Category', type: 'select', options: M.CATEGORIES, value: p ? p.category : M.CATEGORIES[0] },
       { k: 'brand', label: 'Brand', value: p ? p.brand : '' },
       { k: 'model', label: 'Model', value: p ? p.model : '' },
-      { k: 'sku', label: 'SKU / Product ID', value: p ? p.sku : M.nextSKU(true), help: 'Generated automatically' },
+      { k: 'sku', label: 'SKU / Product ID', value: p ? p.sku : M.nextSKU(true), help: p ? 'Must not match any other product' : 'Continues from your last code (MG-123 → MG-124)' },
       { type: 'section', label: 'Price' },
       { k: 'costPrice', label: 'Purchase price (₹)', type: 'number', value: p ? p.costPrice : '', attrs: 'inputmode="decimal" step="0.01" min="0"' },
       { k: 'sellPrice', label: 'Selling price (₹)', type: 'number', value: p ? p.sellPrice : '', attrs: 'inputmode="decimal" step="0.01" min="0"' },
@@ -8105,12 +8220,20 @@ Minimum version required to store current data is: `+i+`.
             d.image = imageData;
             var rows = readVariants(a.el);
             if (!rows.length) return App.toast('Add at least one size/colour row.', 'err');
+            /* SKU: the pre-filled code is always free; a code typed by hand must not belong to another product */
+            var skuIn = String(d.sku || '').trim();
+            if (!p && skuIn === M.nextSKU(true)) { d.sku = ''; skuIn = ''; }
+            var skuClash = skuIn ? M.skuOwner(skuIn, p ? p.id : null) : null;
+            if (skuClash) {
+              var why = skuClash.deletedAt
+                ? 'was used by deleted product "' + skuClash.name + '" and cannot be used again'
+                : 'is already used by "' + skuClash.name + '"';
+              App.toast('SKU ' + skuIn + ' ' + why, 'err', 6000);
+              return UI.markError(a.el, 'sku', skuClash.deletedAt ? 'Used by a deleted product — cannot be reused' : 'Already used by "' + skuClash.name + '"');
+            }
             var saved;
             if (p) { M.productUpdate(p.id, d); M.setVariants(p.id, rows); saved = M.find('products', p.id); }
             else {
-              if (d.sku === M.nextSKU(true)) d.sku = '';
-              if (d.sku && M.products().some(function (x) { return x.sku === d.sku.trim(); }))
-                return UI.markError(a.el, 'sku', 'This SKU already exists');
               d.variants = rows;
               saved = M.productCreate(d);
             }
